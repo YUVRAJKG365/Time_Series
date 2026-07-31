@@ -362,7 +362,7 @@ def time_series_analysis(df: pd.DataFrame, date_col: str, value_col: str) -> pd.
 
     except Exception as e:
         st.error(f"Unexpected error in time series analysis: {e}")
-        return df:
+        return df
 
 
 def _render_overview(df, date_col, value_col):
