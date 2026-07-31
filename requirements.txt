@@ -1,0 +1,17 @@
+streamlit
+pandas
+numpy
+plotly
+prophet
+scikit-learn
+statsmodels
+psutil
+dask
+PyMuPDF
+Pillow
+chardet
+langdetect
+PyPDF2
+openpyxl
+python-docx
+python-pptx
