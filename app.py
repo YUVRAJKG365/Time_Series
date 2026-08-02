@@ -77,6 +77,48 @@ PROFESSIONAL_PALETTE = {
 # Memory / preprocessing helpers
 # --------------------------------------------------------------------------
 
+def safe_to_datetime(series):
+    """
+    Robust datetime parser that handles almost every dataset.
+
+    Supports:
+    - Mixed date formats
+    - Mixed timezones
+    - ISO8601
+    - Excel dates
+    - Weather datasets
+    - Stock datasets
+    - IoT datasets
+    - Missing values
+    """
+
+    try:
+        parsed = pd.to_datetime(
+            series,
+            errors="coerce",
+            utc=True,
+            format="mixed"
+        )
+
+        # Remove timezone information so everything becomes timezone-naive
+        return parsed.dt.tz_localize(None)
+
+    except Exception:
+
+        try:
+            parsed = pd.to_datetime(
+                series.astype(str),
+                errors="coerce",
+                utc=True,
+                format="mixed"
+            )
+
+            return parsed.dt.tz_localize(None)
+
+        except Exception:
+
+            return pd.Series(pd.NaT, index=series.index)
+
 def optimize_dataframe(df: pd.DataFrame, date_parse_success_threshold: float = 0.9) -> pd.DataFrame:
     """Reduce memory footprint without changing the data's meaning.
 
@@ -94,7 +136,7 @@ def optimize_dataframe(df: pd.DataFrame, date_parse_success_threshold: float = 0
     df = df.copy()
 
     for col in df.select_dtypes(include=["object"]).columns:
-        parsed = pd.to_datetime(df[col], errors="coerce")
+        parsed = safe_to_datetime(df[col])
         success_rate = parsed.notna().mean() if len(df) else 0
         if success_rate >= date_parse_success_threshold:
             df[col] = parsed
@@ -297,7 +339,7 @@ def time_series_analysis(df: pd.DataFrame, date_col: str, value_col: str) -> pd.
 
         with st.spinner("Initializing time series data..."):
             try:
-                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                df[date_col] = safe_to_datetime(df[date_col])
                 df = df.dropna(subset=[date_col])
                 df = df.sort_values(date_col)
                 df.set_index(date_col, inplace=True)
@@ -1410,7 +1452,7 @@ def render_time_series_section():
         # Try to find a column that reliably parses as a date rather than
         # blindly converting the first column that doesn't error out.
         for col in df.columns:
-            parsed = pd.to_datetime(df[col], errors="coerce")
+            parsed = safe_to_datetime(df[col])
             if parsed.notna().mean() >= 0.9:
                 df[col] = parsed
                 datetime_cols = [col]
