@@ -1,37 +1,3 @@
-"""
-Time Series Analysis module for the EDA App.
-
-Fixes applied vs. the original version (see chat for full rationale):
-  1. Forecast "confidence intervals" are now real, model-derived intervals
-     (ARIMA/SARIMA via get_forecast().summary_frame(), Prophet's native
-     yhat_lower/yhat_upper, Holt-Winters via simulation) instead of a
-     cosmetic +/-10% band that misrepresented uncertainty.
-  2. Moving-Average "forecast" now projects the last rolling value forward
-     instead of relabeling historical rolling-mean values as future data.
-  3. Statistical routines that depend on regular time spacing (seasonal
-     decomposition, ACF/PACF, ADF) always run on the FULL series. Only
-     *plotting* of very large series is downsampled (for rendering speed),
-     never the underlying statistics -- naive `iloc[::step]` striding
-     changes the effective sampling interval and silently corrupts
-     seasonality/autocorrelation results.
-  4. Rolling statistics are computed directly with pandas' vectorized
-     `.rolling()` (already O(n), no chunking needed) instead of chunking
-     the series into independent 10k-row blocks, which produced wrong
-     values at every chunk boundary.
-  5. MAPE is guarded against division by zero.
-  6. The sidebar "Refresh" / "Clear All Data" buttons no longer reference
-     an undefined `session_manager` at module scope (NameError bug).
-  7. Datetime coercion no longer blindly force-converts every object
-     column; it only converts columns that parse with a high success
-     rate, avoiding false-positive date columns.
-  8. Isolation Forest inputs are NaN-dropped first.
-  9. Only integer columns are downcast for memory savings; floats are left
-     at full precision to avoid biasing statistical tests.
- 10. Removed unused imports (dask, pmdarima, seaborn, matplotlib, sklearn
-     StandardScaler / train_test_split, tqdm) to reduce memory footprint
-     and startup time.
-"""
-
 import streamlit as st
 import warnings
 import numpy as np
