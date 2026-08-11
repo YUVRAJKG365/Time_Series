@@ -32,17 +32,16 @@ Fixes applied vs. the original version (see chat for full rationale):
      and startup time.
 """
 
+import streamlit as st
 import warnings
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
 from plotly.subplots import make_subplots
-from prophet import Prophet
+from scipy.stats import linregress
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.seasonal import seasonal_decompose
@@ -76,48 +75,2959 @@ PROFESSIONAL_PALETTE = {
 # --------------------------------------------------------------------------
 # Memory / preprocessing helpers
 # --------------------------------------------------------------------------
-
 def safe_to_datetime(series):
     """
-    Robust datetime parser that handles almost every dataset.
+    Enterprise-grade datetime parser.
 
     Supports:
-    - Mixed date formats
-    - Mixed timezones
-    - ISO8601
-    - Excel dates
-    - Weather datasets
-    - Stock datasets
-    - IoT datasets
-    - Missing values
+    ----------
+    ✓ Mixed datetime formats
+    ✓ Mixed timezones
+    ✓ Excel serial dates
+    ✓ Unix timestamps (seconds)
+    ✓ Unix timestamps (milliseconds)
+    ✓ ISO8601
+    ✓ Numeric timestamps
+    ✓ Weather datasets
+    ✓ Stock datasets
+    ✓ IoT datasets
+    ✓ Missing values
+    ✓ Duplicate timestamps
     """
 
+    if series is None:
+        return pd.Series(dtype="datetime64[ns]")
+
+    s = series.copy()
+
+    # Already datetime
+    if pd.api.types.is_datetime64_any_dtype(s):
+        try:
+            if getattr(s.dt, "tz", None) is not None:
+                return s.dt.tz_convert(None)
+        except:
+            pass
+        return s
+
+    # Empty column
+    if len(s) == 0:
+        return pd.to_datetime(s, errors="coerce")
+
+    ####################################################################
+    # Numeric timestamps
+    ####################################################################
+
+    if pd.api.types.is_numeric_dtype(s):
+
+        numeric = pd.to_numeric(s, errors="coerce")
+
+        valid = numeric.dropna()
+
+        if len(valid):
+
+            median = valid.median()
+
+            # Excel serial dates
+            if 20000 < median < 90000:
+
+                try:
+                    parsed = pd.to_datetime(
+                        numeric,
+                        origin="1899-12-30",
+                        unit="D",
+                        errors="coerce",
+                    )
+
+                    if parsed.notna().mean() > 0.80:
+                        return parsed
+
+                except:
+                    pass
+
+            # Unix milliseconds
+            if median > 1e11:
+
+                try:
+
+                    parsed = pd.to_datetime(
+                        numeric,
+                        unit="ms",
+                        utc=True,
+                        errors="coerce",
+                    ).dt.tz_localize(None)
+
+                    if parsed.notna().mean() > 0.80:
+                        return parsed
+
+                except:
+                    pass
+
+            # Unix seconds
+            if 1e8 < median < 1e11:
+
+                try:
+
+                    parsed = pd.to_datetime(
+                        numeric,
+                        unit="s",
+                        utc=True,
+                        errors="coerce",
+                    ).dt.tz_localize(None)
+
+                    if parsed.notna().mean() > 0.80:
+                        return parsed
+
+                except:
+                    pass
+
+    ####################################################################
+    # Mixed strings
+    ####################################################################
+
+    s = (
+        s.astype(str)
+        .str.strip()
+        .replace(
+            {
+                "": np.nan,
+                "nan": np.nan,
+                "None": np.nan,
+                "NULL": np.nan,
+                "null": np.nan,
+                "NaT": np.nan,
+            }
+        )
+    )
+
+    # First attempt
     try:
+
         parsed = pd.to_datetime(
-            series,
+            s,
             errors="coerce",
             utc=True,
-            format="mixed"
-        )
+            format="mixed",
+        ).dt.tz_localize(None)
 
-        # Remove timezone information so everything becomes timezone-naive
-        return parsed.dt.tz_localize(None)
+        if parsed.notna().mean() > 0.60:
+            return parsed
 
-    except Exception:
+    except:
+        pass
+
+    # Day-first attempt
+    try:
+
+        parsed = pd.to_datetime(
+            s,
+            errors="coerce",
+            utc=True,
+            dayfirst=True,
+            format="mixed",
+        ).dt.tz_localize(None)
+
+        if parsed.notna().mean() > 0.60:
+            return parsed
+
+    except:
+        pass
+
+    # Infer format
+    try:
+
+        parsed = pd.to_datetime(
+            s,
+            errors="coerce",
+            utc=True,
+            infer_datetime_format=True,
+        ).dt.tz_localize(None)
+
+        return parsed
+
+    except:
+
+        return pd.Series(pd.NaT, index=s.index)
+
+def detect_datetime_column(df: pd.DataFrame):
+    """
+    Automatically detects the best datetime column.
+
+    Returns
+    -------
+    column_name or None
+    """
+
+    if df is None or df.empty:
+        return None
+
+    # Common datetime column names
+    priority_names = [
+        "date",
+        "datetime",
+        "timestamp",
+        "time",
+        "day",
+        "month",
+        "year",
+        "created_at",
+        "updated_at",
+        "order_date",
+        "invoice_date",
+        "transaction_date",
+        "purchase_date",
+        "sales_date",
+        "weather_date",
+        "observation_date",
+        "observation_time",
+        "measurement_time",
+        "recorded_at",
+        "event_time",
+        "event_date",
+        "log_time",
+        "log_date",
+        "dt"
+    ]
+
+    # ---------- STEP 1 ----------
+    # Check by column name first
+
+    for keyword in priority_names:
+
+        for col in df.columns:
+
+            if keyword in str(col).lower():
+
+                parsed = safe_to_datetime(df[col])
+
+                success = parsed.notna().mean()
+
+                if success >= 0.60:
+
+                    return col
+
+    # ---------- STEP 2 ----------
+    # Score every object/string column
+
+    scores = {}
+
+    for col in df.columns:
 
         try:
-            parsed = pd.to_datetime(
-                series.astype(str),
-                errors="coerce",
-                utc=True,
-                format="mixed"
+
+            parsed = safe_to_datetime(df[col])
+
+            success = parsed.notna().mean()
+
+            unique = parsed.nunique()
+
+            score = (
+                success * 100
+                + min(unique, 100) * 0.05
             )
 
-            return parsed.dt.tz_localize(None)
+            scores[col] = score
 
         except Exception:
 
-            return pd.Series(pd.NaT, index=series.index)
+            continue
+
+    if len(scores):
+
+        best = max(scores, key=scores.get)
+
+        if scores[best] >= 60:
+
+            return best
+
+    # ---------- STEP 3 ----------
+    # Numeric datetime detection
+    # Excel serial / Unix timestamps
+
+    for col in df.select_dtypes(include=np.number).columns:
+
+        parsed = safe_to_datetime(df[col])
+
+        success = parsed.notna().mean()
+
+        if success >= 0.80:
+
+            return col
+
+    return None
+
+def detect_target_column(df: pd.DataFrame):
+    """
+    Detect the best forecasting target column.
+
+    Returns
+    -------
+    recommended_column
+    scores_dictionary
+    """
+
+    if df is None or df.empty:
+        return None, {}
+
+    scores = {}
+
+    priority_keywords = [
+        "sales",
+        "revenue",
+        "profit",
+        "price",
+        "temperature",
+        "temp",
+        "humidity",
+        "rain",
+        "rainfall",
+        "wind",
+        "pressure",
+        "load",
+        "demand",
+        "consumption",
+        "power",
+        "energy",
+        "traffic",
+        "count",
+        "volume",
+        "production",
+        "stock",
+        "close",
+        "open",
+        "high",
+        "low",
+        "cases",
+        "patients"
+    ]
+
+    ignore_keywords = [
+        "id",
+        "index",
+        "serial",
+        "zipcode",
+        "postal",
+        "pin",
+        "phone",
+        "mobile"
+    ]
+
+    numeric_cols = list(df.select_dtypes(include=np.number).columns)
+
+    if not numeric_cols:
+        return None, {}
+
+    for col in numeric_cols:
+
+        score = 0
+
+        name = str(col).lower()
+
+        # Ignore ID columns
+        if any(x in name for x in ignore_keywords):
+            continue
+
+        # Priority names
+        if any(x in name for x in priority_keywords):
+            score += 40
+
+        series = df[col]
+
+        # Missing values
+        missing_ratio = series.isna().mean()
+        score += (1 - missing_ratio) * 20
+
+        # Variance
+        try:
+            variance = series.var()
+
+            if variance > 0:
+                score += 15
+        except:
+            pass
+
+        # Unique values
+        unique_ratio = series.nunique() / max(len(series), 1)
+
+        if unique_ratio > 0.30:
+            score += 15
+
+        # Continuous values
+        if series.nunique() > 20:
+            score += 10
+
+        scores[col] = round(score, 2)
+
+    if not scores:
+        return None, {}
+
+    best = max(scores, key=scores.get)
+
+    return best, scores
+
+def detect_frequency(df: pd.DataFrame, date_col: str):
+    """
+    Intelligent frequency detection.
+
+    Returns
+    -------
+    {
+        "code": "D",
+        "name": "Daily",
+        "seasonal_period": 7,
+        "delta": Timedelta(...)
+    }
+    """
+
+    result = {
+        "code": None,
+        "name": "Unknown",
+        "seasonal_period": None,
+        "delta": None,
+    }
+
+    if date_col is None:
+        return result
+
+    dates = safe_to_datetime(df[date_col])
+
+    dates = dates.dropna().sort_values()
+
+    if len(dates) < 3:
+        return result
+
+    # ---------------------------------------------------------
+    # Try pandas first
+    # ---------------------------------------------------------
+
+    try:
+
+        inferred = pd.infer_freq(dates)
+
+        if inferred is not None:
+
+            result["code"] = inferred
+
+            mapping = {
+                "H": ("Hourly", 24),
+                "D": ("Daily", 7),
+                "W": ("Weekly", 52),
+                "M": ("Monthly", 12),
+                "MS": ("Monthly", 12),
+                "Q": ("Quarterly", 4),
+                "QS": ("Quarterly", 4),
+                "Y": ("Yearly", 1),
+                "YS": ("Yearly", 1),
+                "T": ("Minute", 60),
+                "min": ("Minute", 60),
+            }
+
+            if inferred in mapping:
+
+                result["name"] = mapping[inferred][0]
+
+                result["seasonal_period"] = mapping[inferred][1]
+
+                return result
+
+    except Exception:
+        pass
+
+    # ---------------------------------------------------------
+    # Manual detection
+    # ---------------------------------------------------------
+
+    delta = dates.diff().dropna()
+
+    if len(delta) == 0:
+        return result
+
+    median = delta.median()
+
+    result["delta"] = median
+
+    hours = median.total_seconds() / 3600
+
+    days = median.total_seconds() / 86400
+
+    if hours <= 1.1:
+
+        result["code"] = "H"
+
+        result["name"] = "Hourly"
+
+        result["seasonal_period"] = 24
+
+    elif days <= 1.5:
+
+        result["code"] = "D"
+
+        result["name"] = "Daily"
+
+        result["seasonal_period"] = 7
+
+    elif days <= 8:
+
+        result["code"] = "W"
+
+        result["name"] = "Weekly"
+
+        result["seasonal_period"] = 52
+
+    elif 27 <= days <= 32:
+
+        result["code"] = "M"
+
+        result["name"] = "Monthly"
+
+        result["seasonal_period"] = 12
+
+    elif 80 <= days <= 100:
+
+        result["code"] = "Q"
+
+        result["name"] = "Quarterly"
+
+        result["seasonal_period"] = 4
+
+    elif 360 <= days <= 370:
+
+        result["code"] = "Y"
+
+        result["name"] = "Yearly"
+
+        result["seasonal_period"] = 1
+
+    else:
+
+        result["code"] = "IRREGULAR"
+
+        result["name"] = "Irregular"
+
+        result["seasonal_period"] = None
+
+    return result
+
+def analyze_dataset(df: pd.DataFrame):
+    """
+    Intelligent dataset analyzer.
+
+    Returns
+    -------
+    dict containing all important dataset information.
+    """
+
+    analysis = {}
+
+    if df is None or df.empty:
+        return analysis
+
+    # -------------------------------------------------------
+    # Basic Information
+    # -------------------------------------------------------
+
+    analysis["rows"] = len(df)
+    analysis["columns"] = len(df.columns)
+
+    analysis["missing_percent"] = round(
+        df.isna().sum().sum()
+        / max(df.size, 1)
+        * 100,
+        2,
+    )
+
+    analysis["duplicate_rows"] = int(df.duplicated().sum())
+
+    # -------------------------------------------------------
+    # Detect Date Column
+    # -------------------------------------------------------
+
+    date_col = detect_datetime_column(df)
+
+    analysis["date_column"] = date_col
+
+    # -------------------------------------------------------
+    # Detect Target Column
+    # -------------------------------------------------------
+
+    target_col, target_scores = detect_target_column(df)
+
+    analysis["target_column"] = target_col
+
+    analysis["target_scores"] = target_scores
+
+    # -------------------------------------------------------
+    # Numeric Columns
+    # -------------------------------------------------------
+
+    numeric_cols = list(df.select_dtypes(include=np.number).columns)
+
+    analysis["numeric_columns"] = numeric_cols
+
+    # -------------------------------------------------------
+    # Dataset Type
+    # -------------------------------------------------------
+
+    dataset_type = "Generic Time Series"
+
+    names = " ".join(df.columns.astype(str)).lower()
+
+    if any(x in names for x in ["temp", "humidity", "wind", "rain", "pressure"]):
+        dataset_type = "Weather Dataset"
+
+    elif any(x in names for x in ["sales", "revenue", "profit"]):
+        dataset_type = "Sales Dataset"
+
+    elif any(x in names for x in ["close", "open", "volume", "stock"]):
+        dataset_type = "Stock Market Dataset"
+
+    elif any(x in names for x in ["sensor", "iot", "device"]):
+        dataset_type = "IoT Dataset"
+
+    elif any(x in names for x in ["power", "load", "energy"]):
+        dataset_type = "Energy Dataset"
+
+    elif any(x in names for x in ["traffic", "vehicle"]):
+        dataset_type = "Traffic Dataset"
+
+    analysis["dataset_type"] = dataset_type
+
+    # -------------------------------------------------------
+    # Frequency Detection
+    # -------------------------------------------------------
+
+    # -------------------------------------------------------
+    # Frequency Detection
+    # -------------------------------------------------------
+
+    frequency = detect_frequency(df, date_col)
+
+    analysis["frequency"] = frequency
+
+    # -------------------------------------------------------
+    # Trend & Seasonality
+    # -------------------------------------------------------
+
+    if (
+            date_col is not None
+            and target_col is not None
+            and date_col in df.columns
+            and target_col in df.columns
+    ):
+        ts_info = detect_trend_and_seasonality(
+            df,
+            date_col,
+            target_col,
+        )
+
+        analysis.update(ts_info)
+
+    # -------------------------------------------------------
+    # Time Span
+    # -------------------------------------------------------
+
+    if date_col is not None:
+
+        dates = safe_to_datetime(df[date_col])
+
+        analysis["start_date"] = dates.min()
+
+        analysis["end_date"] = dates.max()
+
+        analysis["total_days"] = (
+            dates.max() - dates.min()
+        ).days
+
+    else:
+
+        analysis["start_date"] = None
+
+        analysis["end_date"] = None
+
+        analysis["total_days"] = None
+
+    return analysis
+
+def clean_time_series(
+    df: pd.DataFrame,
+    date_col: str,
+    value_col: str,
+):
+    """
+    Professional Time Series Cleaning Pipeline
+
+    Performs:
+    ----------
+    ✓ Datetime conversion
+    ✓ Remove invalid timestamps
+    ✓ Remove duplicate timestamps
+    ✓ Sort chronologically
+    ✓ Handle missing target values
+    ✓ Infer frequency
+    ✓ Fill missing timestamps
+    ✓ Time interpolation
+    ✓ Forward/Backward fill
+    ✓ Remove duplicate observations
+    ✓ Reset index
+
+    Returns
+    -------
+    cleaned_df
+    cleaning_report
+    """
+
+    report = {
+        "original_rows": len(df),
+        "rows_removed": 0,
+        "duplicates_removed": 0,
+        "missing_dates_filled": 0,
+        "missing_values_filled": 0,
+        "frequency": None,
+    }
+
+    df = df.copy()
+
+    # ---------------------------------------------------------
+    # Datetime Conversion
+    # ---------------------------------------------------------
+
+    df[date_col] = safe_to_datetime(df[date_col])
+
+    before = len(df)
+
+    df = df[df[date_col].notna()].copy()
+
+    report["rows_removed"] += before - len(df)
+
+    # ---------------------------------------------------------
+    # Remove duplicate timestamps
+    # ---------------------------------------------------------
+
+    before = len(df)
+
+    df = df.drop_duplicates(subset=date_col)
+
+    report["duplicates_removed"] = before - len(df)
+
+    # ---------------------------------------------------------
+    # Sort
+    # ---------------------------------------------------------
+
+    df = df.sort_values(date_col)
+
+    # ---------------------------------------------------------
+    # Set Datetime Index
+    # ---------------------------------------------------------
+
+    df = df.set_index(date_col)
+
+    # ---------------------------------------------------------
+    # Detect Frequency
+    # ---------------------------------------------------------
+
+    freq_info = detect_frequency(
+        df.reset_index(),
+        date_col,
+    )
+
+    report["frequency"] = freq_info["name"]
+
+    freq = freq_info["code"]
+
+    # ---------------------------------------------------------
+    # Fill Missing Dates
+    # ---------------------------------------------------------
+
+    if freq not in [None, "IRREGULAR"]:
+
+        try:
+
+            full_index = pd.date_range(
+                start=df.index.min(),
+                end=df.index.max(),
+                freq=freq,
+            )
+
+            report["missing_dates_filled"] = (
+                len(full_index) - len(df)
+            )
+
+            df = df.reindex(full_index)
+
+            df.index.name = date_col
+
+        except Exception:
+
+            pass
+
+    # ---------------------------------------------------------
+    # Handle Missing Target Values
+    # ---------------------------------------------------------
+
+    if value_col in df.columns:
+
+        before = df[value_col].isna().sum()
+
+        try:
+
+            df[value_col] = df[value_col].interpolate(
+                method="time",
+                limit_direction="both",
+            )
+
+        except Exception:
+
+            df[value_col] = df[value_col].interpolate()
+
+        df[value_col] = (
+            df[value_col]
+            .ffill()
+            .bfill()
+        )
+
+        after = df[value_col].isna().sum()
+
+        report["missing_values_filled"] = before - after
+
+    # ---------------------------------------------------------
+    # Remove duplicate rows
+    # ---------------------------------------------------------
+
+    df = df.drop_duplicates()
+
+    # ---------------------------------------------------------
+    # Reset Index
+    # ---------------------------------------------------------
+
+    df = df.reset_index()
+
+    report["final_rows"] = len(df)
+
+    return df, report
+
+def detect_trend_and_seasonality(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str
+):
+    """
+    Detect trend, seasonality and data characteristics.
+
+    Returns
+    -------
+    Dictionary containing:
+
+    trend_direction
+    trend_strength
+    seasonality
+    seasonal_strength
+    noise_level
+    recommended_model
+    """
+
+    result = {}
+
+    if df.empty:
+        return result
+
+    try:
+
+        series = (
+            df[[date_col, value_col]]
+            .dropna()
+            .copy()
+        )
+
+        series = series.sort_values(date_col)
+
+        y = series[value_col].astype(float)
+
+        x = np.arange(len(y))
+
+        # --------------------------------------------------
+        # TREND
+        # --------------------------------------------------
+
+        slope, intercept = np.polyfit(x, y, 1)
+
+        trend_std = np.std(intercept + slope * x)
+
+        data_std = np.std(y)
+
+        if data_std == 0:
+            trend_strength = 0
+        else:
+            trend_strength = trend_std / data_std
+
+        if slope > 0:
+
+            direction = "Increasing"
+
+        elif slope < 0:
+
+            direction = "Decreasing"
+
+        else:
+
+            direction = "Flat"
+
+        result["trend_direction"] = direction
+
+        result["trend_strength"] = round(
+            float(trend_strength),
+            3,
+        )
+
+        # --------------------------------------------------
+        # SEASONALITY
+        # --------------------------------------------------
+
+        freq = detect_frequency(df, date_col)
+
+        period = freq["seasonal_period"]
+
+        result["seasonal_period"] = period
+
+        seasonality = "Unknown"
+
+        seasonal_strength = 0
+
+        if (
+            period is not None
+            and len(y) >= period * 2
+        ):
+
+            try:
+
+                decomposition = seasonal_decompose(
+                    y,
+                    model="additive",
+                    period=period,
+                    extrapolate_trend="freq",
+                )
+
+                seasonal = decomposition.seasonal
+
+                residual = decomposition.resid
+
+                seasonal_strength = (
+                    np.nanstd(seasonal)
+                    /
+                    np.nanstd(y)
+                )
+
+                if seasonal_strength > 0.60:
+
+                    seasonality = "Strong"
+
+                elif seasonal_strength > 0.30:
+
+                    seasonality = "Moderate"
+
+                else:
+
+                    seasonality = "Weak"
+
+            except Exception:
+
+                pass
+
+        result["seasonality"] = seasonality
+
+        result["seasonal_strength"] = round(
+            float(seasonal_strength),
+            3,
+        )
+
+        # --------------------------------------------------
+        # Noise
+        # --------------------------------------------------
+
+        rolling = y.rolling(
+            window=max(5, len(y)//20),
+            center=True
+        ).mean()
+
+        noise = np.nanstd(y - rolling)
+
+        result["noise_level"] = round(
+            float(noise),
+            3,
+        )
+
+        # --------------------------------------------------
+        # Recommended Model
+        # --------------------------------------------------
+
+        if (
+            direction != "Flat"
+            and seasonality == "Strong"
+        ):
+
+            model = "SARIMA"
+
+        elif direction != "Flat":
+
+            model = "ARIMA"
+
+        elif seasonality == "Strong":
+
+            model = "Exponential Smoothing"
+
+        else:
+
+            model = "Prophet"
+
+        result["recommended_model"] = model
+
+        return result
+
+    except Exception:
+
+        return {}
+
+def prepare_forecast_data(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str,
+):
+    """
+    Prepare dataset for forecasting.
+
+    Returns
+    -------
+    cleaned dataframe
+    metadata
+    """
+
+    metadata = {}
+
+    df = df.copy()
+
+    # ---------------------------------------
+    # Clean Dataset
+    # ---------------------------------------
+
+    df, cleaning_report = clean_time_series(
+        df,
+        date_col,
+        value_col,
+    )
+
+    metadata["cleaning"] = cleaning_report
+
+    # ---------------------------------------
+    # AI Analysis
+    # ---------------------------------------
+
+    analysis = analyze_dataset(df)
+
+    metadata["analysis"] = analysis
+
+    # ---------------------------------------
+    # Datetime Index
+    # ---------------------------------------
+
+    df = df.set_index(date_col)
+
+    # ---------------------------------------
+    # Keep only target
+    # ---------------------------------------
+
+    df = df[[value_col]]
+
+    # ---------------------------------------
+    # Float conversion
+    # ---------------------------------------
+
+    df[value_col] = pd.to_numeric(
+        df[value_col],
+        errors="coerce",
+    )
+
+    df = df.dropna()
+
+    # Reduce extremely large datasets while preserving temporal structure
+    if len(df) > 50000:
+        step = max(1, len(df) // 50000)
+
+        df = df.iloc[::step].copy()
+
+    # ---------------------------------------
+    # Final validation
+    # ---------------------------------------
+
+    if len(df) < 20:
+        raise ValueError(
+            "Dataset is too small for reliable forecasting."
+        )
+
+    return df, metadata
+
+def split_train_test(
+        df: pd.DataFrame,
+        target_col: str,
+):
+    """
+    Adaptive train-test split.
+    """
+
+    n = len(df)
+
+    if n < 100:
+        test_size = 0.30
+
+    elif n < 1000:
+        test_size = 0.20
+
+    elif n < 10000:
+        test_size = 0.15
+
+    else:
+        test_size = 0.10
+
+    split_index = int(n * (1 - test_size))
+
+    train_df = df.iloc[:split_index].copy()
+    test_df = df.iloc[split_index:].copy()
+
+    return train_df, test_df
+
+def calculate_forecast_metrics(
+        actual,
+        predicted,
+):
+    """
+    Calculate forecasting metrics.
+    """
+
+    actual = np.asarray(actual)
+
+    predicted = np.asarray(predicted)
+
+    mae = mean_absolute_error(
+        actual,
+        predicted,
+    )
+
+    rmse = np.sqrt(
+        mean_squared_error(
+            actual,
+            predicted,
+        )
+    )
+
+    mape = np.mean(
+        np.abs(
+            (actual - predicted)
+            /
+            np.maximum(
+                np.abs(actual),
+                1e-9,
+            )
+        )
+    ) * 100
+
+    r2 = r2_score(
+        actual,
+        predicted,
+    )
+
+    return {
+        "MAE": round(float(mae), 4),
+        "RMSE": round(float(rmse), 4),
+        "MAPE": round(float(mape), 2),
+        "R2": round(float(r2), 4),
+    }
+
+def train_forecasting_models(
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_col: str,
+        models_to_train: list = None,
+):
+    """
+    Train and evaluate forecasting models.
+
+    Returns
+    -------
+    {
+        "ARIMA": {
+            "model": fitted_model,
+            "forecast": forecast,
+            "metrics": {...}
+        },
+        ...
+    }
+    """
+
+    if models_to_train is None:
+
+        models_to_train = [
+            "Naive",
+            "Moving Average",
+            "ARIMA",
+            "SARIMA",
+            "Holt-Winters",
+        ]
+
+    results = {}
+
+    y_train = train_df[target_col]
+
+    y_test = test_df[target_col]
+
+    forecast_steps = len(test_df)
+
+    # Create progress tracking
+    total_models = len(models_to_train)
+    completed = 0
+
+    # =====================================================
+    # Naive Forecast
+    # =====================================================
+
+    if "Naive" in models_to_train:
+        try:
+            with st.spinner(f"⏳ Training: Naive (1/{total_models})"):
+                forecast = np.repeat(
+                    y_train.iloc[-1],
+                    forecast_steps,
+                )
+
+                metrics = calculate_forecast_metrics(
+                    y_test,
+                    forecast,
+                )
+
+                results["Naive"] = {
+
+                    "model": None,
+
+                    "forecast": forecast,
+
+                    "metrics": metrics,
+                }
+                completed += 1
+
+        except Exception:
+
+            pass
+
+    # =====================================================
+    # Moving Average Forecast
+    # =====================================================
+
+    if "Moving Average" in models_to_train:
+
+        try:
+            with st.spinner(f"⏳ Training: Moving Average (2/{total_models})"):
+                window = min(10, max(3, len(y_train)//10))
+
+                avg = y_train.tail(window).mean()
+
+                forecast = np.repeat(
+                    avg,
+                    forecast_steps,
+                )
+
+                metrics = calculate_forecast_metrics(
+                    y_test,
+                    forecast,
+                )
+
+                results["Moving Average"] = {
+
+                    "model": None,
+
+                    "forecast": forecast,
+
+                    "metrics": metrics,
+                }
+                completed += 1
+
+        except Exception:
+
+            pass
+
+        # =====================================================
+        # ARIMA
+        # =====================================================
+
+    if "ARIMA" in models_to_train:
+
+        try:
+            with st.spinner(f"⏳ Training: ARIMA (3/{total_models})..."):
+                results["ARIMA"] = train_arima_model(
+                    train_df,
+                    test_df,
+                    target_col,
+                )
+                completed += 1
+
+        except Exception:
+
+            pass
+
+    # =====================================================
+    # SARIMA
+    # =====================================================
+
+    if "SARIMA" in models_to_train:
+
+        try:
+            with st.spinner(f"⏳ Training: SARIMA (4/{total_models})..."):
+                results["SARIMA"] = train_sarima_model(
+                    train_df,
+                    test_df,
+                    train_df.index.name,
+                    target_col,
+                )
+                completed += 1
+
+        except Exception:
+
+            pass
+
+    # =====================================================
+    # Holt-Winters
+    # =====================================================
+
+    if "Holt-Winters" in models_to_train:
+
+        try:
+            with st.spinner(f"⏳ Training: Holt-Winters (5/{total_models})..."):
+                results["Holt-Winters"] = train_holt_winters_model(
+                    train_df,
+                    test_df,
+                    train_df.index.name,
+                    target_col,
+                )
+                completed += 1
+
+        except Exception:
+
+            pass
+
+    return results
+
+def train_arima_model(
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_col: str,
+        max_p: int = 3,
+        max_d: int = 2,
+        max_q: int = 3,
+):
+    """
+    Train ARIMA using automatic parameter search.
+
+    Returns
+    -------
+    {
+        "model": fitted_model,
+        "forecast": forecast,
+        "metrics": {...},
+        "order": (p,d,q)
+    }
+    """
+
+    y_train = train_df[target_col]
+    y_test = test_df[target_col]
+
+    # ---------------------------------------------
+    # Automatic differencing recommendation
+    # ---------------------------------------------
+
+    stationarity = check_stationarity(
+        train_df,
+        target_col,
+    )
+
+    recommended_d = stationarity["recommended_d"]
+
+    best_model = None
+    best_order = None
+    best_forecast = None
+    best_metrics = None
+
+    best_rmse = float("inf")
+
+    # ---------------------------------------------------
+    # Adaptive ARIMA Search Space
+    # ---------------------------------------------------
+
+    n = len(train_df)
+
+    if n < 1000:
+
+        max_p = 3
+        max_q = 3
+
+    elif n < 10000:
+
+        max_p = 2
+        max_q = 2
+
+    else:
+
+        max_p = 1
+        max_q = 1
+
+    for p in range(max_p + 1):
+
+        for d in [recommended_d]:
+
+            for q in range(max_q + 1):
+                if p == 0 and d == 0 and q == 0:
+                    continue
+
+                try:
+
+                    model = ARIMA(
+                        y_train,
+                        order=(p, d, q),
+                    )
+
+                    fitted = model.fit()
+
+                    forecast = fitted.forecast(
+                        steps=len(y_test)
+                    )
+
+                    metrics = calculate_forecast_metrics(
+                        y_test,
+                        forecast,
+                    )
+
+                    rmse = metrics["RMSE"]
+
+                    if rmse < best_rmse:
+
+                        best_rmse = rmse
+
+                        best_model = fitted
+
+                        best_order = (p, d, q)
+
+                        best_forecast = forecast
+
+                        best_metrics = metrics
+
+                except Exception:
+
+                    continue
+
+    if best_model is None:
+
+        raise RuntimeError(
+            "ARIMA could not be trained on this dataset."
+        )
+
+    return {
+
+        "model": best_model,
+
+        "forecast": best_forecast,
+
+        "metrics": best_metrics,
+
+        "order": best_order,
+
+        "stationarity": stationarity,
+    }
+
+def train_sarima_model(
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        date_col: str,
+        target_col: str,
+        max_p: int = 2,
+        max_q: int = 2,
+        max_P: int = 1,
+        max_Q: int = 1,
+):
+    """
+    Train SARIMA with automatic seasonal parameter selection.
+
+    Returns
+    -------
+    {
+        "model": fitted_model,
+        "forecast": forecast,
+        "metrics": {...},
+        "order": (...),
+        "seasonal_order": (...),
+        "stationarity": {...}
+    }
+    """
+
+    y_train = (
+        pd.to_numeric(
+            train_df[target_col],
+            errors="coerce"
+        )
+        .dropna()
+    )
+
+    y_test = (
+        pd.to_numeric(
+            test_df[target_col],
+            errors="coerce"
+        )
+        .dropna()
+    )
+
+    if len(y_train) < 30:
+        raise ValueError(
+            "Dataset too small for SARIMA."
+        )
+
+    # ----------------------------------------
+    # Stationarity
+    # ----------------------------------------
+
+    stationarity = check_stationarity(
+        train_df,
+        target_col,
+    )
+
+    d = stationarity["recommended_d"]
+
+    # ----------------------------------------
+    # Seasonality
+    # ----------------------------------------
+
+    seasonality = detect_seasonality(
+        train_df.reset_index(),
+        date_col,
+        target_col,
+    )
+
+    m = seasonality["seasonal_period"]
+
+    if m is None:
+        raise ValueError(
+            "Seasonality not detected."
+        )
+
+    best_model = None
+    best_forecast = None
+    best_metrics = None
+    best_order = None
+    best_seasonal = None
+
+    best_rmse = float("inf")
+    n = len(train_df)
+
+    if n < 1000:
+
+        max_p = 2
+        max_q = 2
+        max_P = 1
+        max_Q = 1
+
+    elif n < 10000:
+
+        max_p = 1
+        max_q = 1
+        max_P = 1
+        max_Q = 1
+
+    else:
+
+        max_p = 1
+        max_q = 1
+        max_P = 1
+        max_Q = 0
+
+    for p in range(max_p + 1):
+
+        for q in range(max_q + 1):
+
+            for P in range(max_P + 1):
+
+                for Q in range(max_Q + 1):
+
+                    if (
+                        p == 0
+                        and d == 0
+                        and q == 0
+                        and P == 0
+                        and Q == 0
+                    ):
+                        continue
+
+                    try:
+
+                        model = SARIMAX(
+                            y_train,
+                            order=(p, d, q),
+                            seasonal_order=(P, d, Q, m),
+                            enforce_stationarity=False,
+                            enforce_invertibility=False,
+                        )
+
+                        fitted = model.fit(
+                            disp=False
+                        )
+
+                        forecast = fitted.forecast(
+                            steps=len(y_test)
+                        )
+
+                        metrics = calculate_forecast_metrics(
+                            y_test,
+                            forecast,
+                        )
+
+                        rmse = metrics["RMSE"]
+
+                        if rmse < best_rmse:
+
+                            best_rmse = rmse
+
+                            best_model = fitted
+
+                            best_forecast = forecast
+
+                            best_metrics = metrics
+
+                            best_order = (
+                                p,
+                                d,
+                                q,
+                            )
+
+                            best_seasonal = (
+                                P,
+                                d,
+                                Q,
+                                m,
+                            )
+
+                    except Exception:
+
+                        continue
+
+    if best_model is None:
+
+        raise RuntimeError(
+            "SARIMA training failed."
+        )
+
+    return {
+
+        "model": best_model,
+
+        "forecast": best_forecast,
+
+        "metrics": best_metrics,
+
+        "order": best_order,
+
+        "seasonal_order": best_seasonal,
+
+        "stationarity": stationarity,
+
+        "seasonality": seasonality,
+    }
+
+def train_holt_winters_model(
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        date_col: str,
+        target_col: str,
+):
+    """
+    Train Holt-Winters Exponential Smoothing.
+
+    Automatically detects trend and seasonality.
+
+    Returns
+    -------
+    {
+        model,
+        forecast,
+        metrics,
+        trend,
+        seasonal,
+        seasonal_period
+    }
+    """
+
+    y_train = (
+        pd.to_numeric(
+            train_df[target_col],
+            errors="coerce"
+        )
+        .dropna()
+    )
+
+    y_test = (
+        pd.to_numeric(
+            test_df[target_col],
+            errors="coerce"
+        )
+        .dropna()
+    )
+
+    if len(y_train) < 20:
+        raise ValueError(
+            "Dataset too small."
+        )
+
+    seasonality = detect_seasonality(
+        train_df.reset_index(),
+        date_col,
+        target_col,
+    )
+
+    trend = detect_trend(
+        train_df.reset_index(),
+        date_col,
+        target_col,
+    )
+
+    period = seasonality["seasonal_period"]
+
+    if period is None:
+        period = 12
+
+    trend_component = (
+        "add"
+        if trend["trend_direction"] != "Flat"
+        else None
+    )
+
+    seasonal_component = (
+        "add"
+        if seasonality["seasonality"] in [
+            "Moderate",
+            "Strong",
+        ]
+        else None
+    )
+
+    model = ExponentialSmoothing(
+        y_train,
+        trend=trend_component,
+        seasonal=seasonal_component,
+        seasonal_periods=period,
+    )
+
+    fitted = model.fit(
+        optimized=True,
+    )
+
+    forecast = fitted.forecast(
+        len(y_test)
+    )
+
+    metrics = calculate_forecast_metrics(
+        y_test,
+        forecast,
+    )
+
+    return {
+
+        "model": fitted,
+
+        "forecast": forecast,
+
+        "metrics": metrics,
+
+        "trend": trend,
+
+        "seasonality": seasonality,
+
+        "trend_component": trend_component,
+
+        "seasonal_component": seasonal_component,
+    }
+
+def generate_future_forecast(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str,
+        model_name: str,
+        forecast_steps: int,
+):
+    """
+    Generate future forecast using the selected model.
+
+    Returns
+    -------
+    {
+        "future_dates": ...,
+        "forecast": ...,
+        "lower": ...,
+        "upper": ...
+    }
+    """
+
+    df = df.copy()
+
+    df[date_col] = safe_to_datetime(df[date_col])
+
+    df = (
+        df.dropna(subset=[date_col, value_col])
+          .sort_values(date_col)
+    )
+
+    series = pd.to_numeric(
+        df[value_col],
+        errors="coerce",
+    ).dropna()
+
+    freq_info = detect_frequency(df, date_col)
+
+    freq = freq_info["code"]
+
+    if freq in [None, "IRREGULAR"]:
+        freq = "D"
+
+    # Normalize offset codes for pandas 2.x compatibility.
+    freq_map = {
+        "m": "ME",
+        "M": "ME",
+        "q": "QE",
+        "Q": "QE",
+        "y": "YE",
+        "Y": "YE",
+        "w": "W",
+        "W": "W",
+        "d": "D",
+        "D": "D",
+        "h": "h",
+        "H": "h",
+        "ms": "MS",
+        "MS": "MS",
+        "qs": "QS",
+        "QS": "QS",
+        "ys": "YS",
+        "YS": "YS",
+        "t": "min",
+        "T": "min",
+    }
+
+    freq = freq_map.get(str(freq), str(freq))
+
+    future_dates = pd.date_range(
+        start=df[date_col].iloc[-1],
+        periods=forecast_steps + 1,
+        freq=freq,
+    )[1:]
+
+    forecast = None
+    lower = None
+    upper = None
+
+    # =====================================================
+    # ARIMA
+    # =====================================================
+
+    if model_name == "ARIMA":
+
+        stationarity = check_stationarity(
+            df,
+            value_col,
+        )
+
+        d = stationarity["recommended_d"]
+
+        best_aic = float("inf")
+        best_model = None
+
+        for p in range(4):
+
+            for q in range(4):
+
+                if p == 0 and d == 0 and q == 0:
+                    continue
+
+                try:
+
+                    model = ARIMA(
+                        series,
+                        order=(p, d, q),
+                    )
+
+                    fitted = model.fit()
+
+                    if fitted.aic < best_aic:
+
+                        best_aic = fitted.aic
+                        best_model = fitted
+
+                except Exception:
+                    continue
+
+        if best_model is None:
+            raise RuntimeError("Unable to fit ARIMA.")
+
+        prediction = best_model.get_forecast(
+            steps=forecast_steps
+        )
+
+        forecast = prediction.predicted_mean.values
+
+        ci = prediction.conf_int()
+
+        lower = ci.iloc[:, 0].values
+
+        upper = ci.iloc[:, 1].values
+
+    # =====================================================
+    # SARIMA
+    # =====================================================
+
+    elif model_name == "SARIMA":
+
+        stationarity = check_stationarity(
+            df,
+            value_col,
+        )
+
+        seasonality = detect_seasonality(
+            df,
+            date_col,
+            value_col,
+        )
+
+        d = stationarity["recommended_d"]
+
+        m = seasonality["seasonal_period"]
+
+        if m is None:
+            m = 12
+
+        model = SARIMAX(
+            series,
+            order=(1, d, 1),
+            seasonal_order=(1, d, 1, m),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+
+        fitted = model.fit(disp=False)
+
+        prediction = fitted.get_forecast(
+            steps=forecast_steps
+        )
+
+        forecast = prediction.predicted_mean.values
+
+        ci = prediction.conf_int()
+
+        lower = ci.iloc[:, 0].values
+
+        upper = ci.iloc[:, 1].values
+
+    # =====================================================
+    # Holt-Winters
+    # =====================================================
+
+    elif model_name == "Holt-Winters":
+
+        seasonality = detect_seasonality(
+            df,
+            date_col,
+            value_col,
+        )
+
+        trend = detect_trend(
+            df,
+            date_col,
+            value_col,
+        )
+
+        period = seasonality["seasonal_period"]
+
+        if period is None:
+            period = 12
+
+        model = ExponentialSmoothing(
+            series,
+            trend="add" if trend["trend_direction"] != "Flat" else None,
+            seasonal="add" if seasonality["seasonality"] != "None" else None,
+            seasonal_periods=period,
+        )
+
+        fitted = model.fit(
+            optimized=True
+        )
+
+        forecast = fitted.forecast(
+            forecast_steps
+        ).values
+
+    # =====================================================
+    # Moving Average
+    # =====================================================
+
+    elif model_name == "Moving Average":
+
+        window = min(
+            10,
+            max(
+                3,
+                len(series) // 10,
+            ),
+        )
+
+        avg = series.tail(window).mean()
+
+        forecast = np.repeat(
+            avg,
+            forecast_steps,
+        )
+
+    # =====================================================
+    # Naive
+    # =====================================================
+
+    else:
+
+        forecast = np.repeat(
+            series.iloc[-1],
+            forecast_steps,
+        )
+
+    return {
+
+        "future_dates": future_dates,
+
+        "forecast": np.asarray(forecast),
+
+        "lower": lower,
+
+        "upper": upper,
+    }
+
+def select_best_forecasting_model(results: dict):
+    """
+    Compare all trained forecasting models and rank them.
+
+    Parameters
+    ----------
+    results : dict
+        Output from train_forecasting_models()
+
+    Returns
+    -------
+    {
+        "best_model": ...,
+        "leaderboard": DataFrame,
+        "results": ...
+    }
+    """
+
+    if not results:
+        raise ValueError("No forecasting models were successfully trained.")
+
+    leaderboard = []
+
+    for model_name, model_info in results.items():
+
+        metrics = model_info.get("metrics", {})
+
+        leaderboard.append({
+
+            "Model": model_name,
+
+            "RMSE": metrics.get("RMSE", np.inf),
+
+            "MAE": metrics.get("MAE", np.inf),
+
+            "MAPE": metrics.get("MAPE", np.inf),
+
+            "R2": metrics.get("R2", -np.inf),
+        })
+
+    leaderboard = pd.DataFrame(leaderboard)
+
+    # -------------------------------------------------
+    # Ranking
+    # -------------------------------------------------
+
+    leaderboard["RMSE Rank"] = leaderboard["RMSE"].rank(method="min")
+
+    leaderboard["MAE Rank"] = leaderboard["MAE"].rank(method="min")
+
+    leaderboard["MAPE Rank"] = leaderboard["MAPE"].rank(method="min")
+
+    leaderboard["R2 Rank"] = (
+        leaderboard["R2"]
+        .rank(method="min", ascending=False)
+    )
+
+    leaderboard["Overall Score"] = (
+
+        leaderboard["RMSE Rank"]
+
+        + leaderboard["MAE Rank"]
+
+        + leaderboard["MAPE Rank"]
+
+        + leaderboard["R2 Rank"]
+
+    )
+
+    leaderboard = leaderboard.sort_values(
+        "Overall Score"
+    ).reset_index(drop=True)
+
+    leaderboard.index += 1
+
+    best_model = leaderboard.iloc[0]["Model"]
+
+    return {
+
+        "best_model": best_model,
+
+        "leaderboard": leaderboard,
+
+        "results": results,
+    }
+@st.cache_data(
+    show_spinner=False,
+    ttl=3600,
+)
+def forecast_pipeline(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str,
+):
+    """
+    Complete AI Forecasting Pipeline.
+
+    Returns
+    -------
+    Dictionary containing
+
+    • Clean data
+
+    • AI analysis
+
+    • Trained models
+
+    • Leaderboard
+
+    • Best model
+    """
+
+    # -----------------------------------------
+    # Prepare
+    # -----------------------------------------
+
+    forecast_df, metadata = prepare_forecast_data(
+        df,
+        date_col,
+        value_col,
+    )
+
+    # -----------------------------------------
+    # Train/Test Split
+    # -----------------------------------------
+
+    train_df, test_df = split_train_test(
+        forecast_df,
+        value_col,
+    )
+
+    # -----------------------------------------
+    # Train Models
+    # -----------------------------------------
+
+    model_results = train_forecasting_models(
+        train_df,
+        test_df,
+        value_col,
+    )
+
+    # -----------------------------------------
+    # Select Best
+    # -----------------------------------------
+
+    comparison = select_best_forecasting_model(
+        model_results
+    )
+
+    metadata["analysis"]["recommended_model"] = comparison["best_model"]
+    metadata["analysis"]["recommendation_reason"] = (
+        f"Best model selected from training results: {comparison['best_model']}."
+        if "analysis" in metadata and metadata["analysis"]
+        else "Best model selected from training results."
+    )
+
+    comparison["metadata"] = metadata
+
+    comparison["train"] = train_df
+
+    comparison["test"] = test_df
+
+    return comparison
+
+def detect_trend(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str,
+):
+    """
+    Detect long-term trend characteristics.
+
+    Returns
+    -------
+    {
+        trend_direction,
+        trend_type,
+        slope,
+        intercept,
+        r2,
+        trend_strength,
+        confidence,
+    }
+    """
+
+    result = {
+        "trend_direction": "Unknown",
+        "trend_type": "Unknown",
+        "slope": 0.0,
+        "intercept": 0.0,
+        "r2": 0.0,
+        "trend_strength": "Unknown",
+        "confidence": 0.0,
+    }
+
+    try:
+
+        if df.empty:
+            return result
+
+        data = (
+            df[[date_col, value_col]]
+            .dropna()
+            .copy()
+            .sort_values(date_col)
+        )
+
+        if len(data) < 10:
+            return result
+
+        y = data[value_col].astype(float).values
+
+        x = np.arange(len(y))
+
+        regression = linregress(x, y)
+
+        slope = regression.slope
+        intercept = regression.intercept
+
+        r2 = regression.rvalue ** 2
+
+        result["slope"] = float(slope)
+        result["intercept"] = float(intercept)
+        result["r2"] = round(float(r2), 4)
+
+        # ---------------------------------------------------
+        # Direction
+        # ---------------------------------------------------
+
+        tolerance = np.std(y) * 0.0005
+
+        if slope > tolerance:
+
+            direction = "Increasing"
+
+        elif slope < -tolerance:
+
+            direction = "Decreasing"
+
+        else:
+
+            direction = "Flat"
+
+        result["trend_direction"] = direction
+
+        # ---------------------------------------------------
+        # Trend Strength
+        # ---------------------------------------------------
+
+        if r2 >= 0.85:
+
+            strength = "Very Strong"
+
+        elif r2 >= 0.65:
+
+            strength = "Strong"
+
+        elif r2 >= 0.40:
+
+            strength = "Moderate"
+
+        elif r2 >= 0.20:
+
+            strength = "Weak"
+
+        else:
+
+            strength = "Very Weak"
+
+        result["trend_strength"] = strength
+
+        # ---------------------------------------------------
+        # Trend Type
+        # ---------------------------------------------------
+
+        linear_pred = intercept + slope * x
+
+        linear_rmse = np.sqrt(
+            np.mean(
+                (y - linear_pred) ** 2
+            )
+        )
+
+        positive = np.all(y > 0)
+
+        if positive:
+
+            try:
+
+                log_y = np.log(y)
+
+                exp_reg = linregress(x, log_y)
+
+                exp_pred = np.exp(
+                    exp_reg.intercept +
+                    exp_reg.slope * x
+                )
+
+                exp_rmse = np.sqrt(
+                    np.mean(
+                        (y - exp_pred) ** 2
+                    )
+                )
+
+                if exp_rmse < linear_rmse * 0.90:
+
+                    trend_type = "Exponential"
+
+                else:
+
+                    trend_type = "Linear"
+
+            except Exception:
+
+                trend_type = "Linear"
+
+        else:
+
+            trend_type = "Linear"
+
+        result["trend_type"] = trend_type
+
+        # ---------------------------------------------------
+        # Confidence
+        # ---------------------------------------------------
+
+        confidence = min(
+            100,
+            max(
+                0,
+                r2 * 100,
+            ),
+        )
+
+        result["confidence"] = round(confidence, 1)
+
+        return result
+
+    except Exception:
+
+        return result
+
+def detect_seasonality(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str,
+):
+    """
+    Detect seasonality using decomposition + autocorrelation.
+
+    Returns
+    -------
+    {
+        seasonality,
+        seasonal_period,
+        seasonal_strength,
+        acf_peak,
+        confidence
+    }
+    """
+
+    result = {
+        "seasonality": "Unknown",
+        "seasonal_period": None,
+        "seasonal_strength": 0.0,
+        "acf_peak": 0.0,
+        "confidence": 0.0,
+    }
+
+    try:
+
+        if df.empty:
+            return result
+
+        data = (
+            df[[date_col, value_col]]
+            .dropna()
+            .copy()
+            .sort_values(date_col)
+        )
+
+        if len(data) < 20:
+            return result
+
+        y = data[value_col].astype(float)
+
+        # --------------------------------------------
+        # Frequency
+        # --------------------------------------------
+
+        freq_info = detect_frequency(df, date_col)
+
+        period = freq_info["seasonal_period"]
+
+        result["seasonal_period"] = period
+
+        if period is None:
+            return result
+
+        if len(y) < period * 2:
+            return result
+
+        # --------------------------------------------
+        # Seasonal Decomposition
+        # --------------------------------------------
+
+        decomposition = seasonal_decompose(
+            y,
+            model="additive",
+            period=period,
+            extrapolate_trend="freq",
+        )
+
+        seasonal = decomposition.seasonal
+
+        strength = (
+            np.nanstd(seasonal)
+            /
+            max(np.nanstd(y), 1e-9)
+        )
+
+        result["seasonal_strength"] = round(
+            float(strength),
+            3,
+        )
+
+        # --------------------------------------------
+        # Autocorrelation
+        # --------------------------------------------
+
+        acf_values = acf(
+            y,
+            nlags=min(period * 3, len(y) // 2),
+            fft=True,
+        )
+
+        peak = np.max(
+            np.abs(
+                acf_values[period:]
+            )
+        )
+
+        result["acf_peak"] = round(
+            float(peak),
+            3,
+        )
+
+        # --------------------------------------------
+        # Seasonality Classification
+        # --------------------------------------------
+
+        score = (
+            strength * 0.6 +
+            peak * 0.4
+        )
+
+        if score >= 0.70:
+
+            label = "Strong"
+
+        elif score >= 0.45:
+
+            label = "Moderate"
+
+        elif score >= 0.25:
+
+            label = "Weak"
+
+        else:
+
+            label = "None"
+
+        result["seasonality"] = label
+
+        result["confidence"] = round(
+            min(score * 100, 100),
+            1,
+        )
+
+        return result
+
+    except Exception:
+
+        return result
+
+def check_stationarity(
+        df: pd.DataFrame,
+        value_col: str,
+):
+    """
+    Check stationarity using Augmented Dickey-Fuller Test.
+
+    Returns
+    -------
+    {
+        stationary,
+        p_value,
+        recommended_d,
+        confidence,
+        interpretation
+    }
+    """
+
+    result = {
+
+        "stationary": False,
+
+        "p_value": None,
+
+        "recommended_d": 1,
+
+        "confidence": 0,
+
+        "interpretation": "Unknown",
+    }
+
+    try:
+
+        series = (
+            pd.to_numeric(
+                df[value_col],
+                errors="coerce",
+            )
+            .dropna()
+        )
+
+        if len(series) < 20:
+
+            return result
+
+        adf = adfuller(series)
+
+        statistic = adf[0]
+
+        pvalue = adf[1]
+
+        result["p_value"] = round(
+            float(pvalue),
+            5,
+        )
+
+        if pvalue < 0.05:
+
+            result["stationary"] = True
+
+            result["recommended_d"] = 0
+
+            result["interpretation"] = (
+                "Series is stationary."
+            )
+
+        else:
+
+            diff1 = series.diff().dropna()
+
+            pvalue1 = adfuller(diff1)[1]
+
+            if pvalue1 < 0.05:
+
+                result["recommended_d"] = 1
+
+            else:
+
+                result["recommended_d"] = 2
+
+            result["stationary"] = False
+
+            result["interpretation"] = (
+                "Series requires differencing."
+            )
+
+        confidence = max(
+            0,
+            min(
+                100,
+                (1 - pvalue) * 100,
+            ),
+        )
+
+        result["confidence"] = round(
+            confidence,
+            1,
+        )
+
+        result["adf_statistic"] = round(
+            float(statistic),
+            4,
+        )
+
+        return result
+
+    except Exception:
+
+        return result
+
+def analyze_signal_quality(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str,
+):
+    """
+    Analyze overall signal quality for forecasting.
+
+    Returns
+    -------
+    {
+        noise_level,
+        signal_strength,
+        signal_to_noise_ratio,
+        missing_percent,
+        outlier_percent,
+        data_quality,
+        forecast_difficulty,
+        confidence
+    }
+    """
+
+    result = {
+        "noise_level": 0.0,
+        "signal_strength": 0.0,
+        "signal_to_noise_ratio": 0.0,
+        "missing_percent": 0.0,
+        "outlier_percent": 0.0,
+        "data_quality": "Unknown",
+        "forecast_difficulty": "Unknown",
+        "confidence": 0.0,
+    }
+
+    try:
+
+        if df.empty:
+            return result
+
+        data = (
+            df[[date_col, value_col]]
+            .dropna()
+            .copy()
+            .sort_values(date_col)
+        )
+
+        if len(data) < 10:
+            return result
+
+        y = data[value_col].astype(float)
+
+        # -------------------------------------------------
+        # Missing %
+        # -------------------------------------------------
+
+        missing_percent = (
+            df[value_col].isna().mean() * 100
+        )
+
+        result["missing_percent"] = round(
+            float(missing_percent),
+            2,
+        )
+
+        # -------------------------------------------------
+        # Outlier %
+        # -------------------------------------------------
+
+        q1 = y.quantile(0.25)
+        q3 = y.quantile(0.75)
+
+        iqr = q3 - q1
+
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+
+        outliers = ((y < lower) | (y > upper)).sum()
+
+        outlier_percent = (
+            outliers / len(y)
+        ) * 100
+
+        result["outlier_percent"] = round(
+            float(outlier_percent),
+            2,
+        )
+
+        # -------------------------------------------------
+        # Noise
+        # -------------------------------------------------
+
+        smooth = (
+            y.rolling(
+                window=max(5, len(y)//25),
+                center=True,
+                min_periods=1,
+            )
+            .mean()
+        )
+
+        noise = np.std(y - smooth)
+
+        signal = np.std(smooth)
+
+        result["noise_level"] = round(
+            float(noise),
+            3,
+        )
+
+        result["signal_strength"] = round(
+            float(signal),
+            3,
+        )
+
+        snr = signal / max(noise, 1e-9)
+
+        result["signal_to_noise_ratio"] = round(
+            float(snr),
+            3,
+        )
+
+        # -------------------------------------------------
+        # Data Quality
+        # -------------------------------------------------
+
+        score = 100
+
+        score -= missing_percent * 0.6
+
+        score -= outlier_percent * 0.8
+
+        if snr < 1:
+            score -= 30
+
+        elif snr < 2:
+            score -= 15
+
+        score = max(0, min(score, 100))
+
+        if score >= 90:
+            quality = "Excellent"
+
+        elif score >= 75:
+            quality = "Good"
+
+        elif score >= 60:
+            quality = "Fair"
+
+        elif score >= 40:
+            quality = "Poor"
+
+        else:
+            quality = "Very Poor"
+
+        result["data_quality"] = quality
+
+        # -------------------------------------------------
+        # Forecast Difficulty
+        # -------------------------------------------------
+
+        if score >= 90:
+
+            difficulty = "Easy"
+
+        elif score >= 70:
+
+            difficulty = "Moderate"
+
+        elif score >= 50:
+
+            difficulty = "Hard"
+
+        else:
+
+            difficulty = "Very Hard"
+
+        result["forecast_difficulty"] = difficulty
+
+        result["confidence"] = round(score, 1)
+
+        return result
+
+    except Exception:
+
+        return result
+
+def detect_trend_and_seasonality(
+        df: pd.DataFrame,
+        date_col: str,
+        value_col: str,
+):
+    """
+    Master AI Time Series Intelligence Engine
+
+    Combines:
+    - Trend Detection
+    - Seasonality Detection
+    - Signal Quality Analysis
+
+    Returns one complete intelligence dictionary.
+    """
+
+    analysis = {}
+
+    if (
+        df is None
+        or df.empty
+        or date_col not in df.columns
+        or value_col not in df.columns
+    ):
+        return analysis
+
+    # ---------------------------------------------------------
+    # Trend
+    # ---------------------------------------------------------
+
+    trend = detect_trend(
+        df,
+        date_col,
+        value_col,
+    )
+
+    analysis.update(trend)
+
+    # ---------------------------------------------------------
+    # Seasonality
+    # ---------------------------------------------------------
+
+    seasonality = detect_seasonality(
+        df,
+        date_col,
+        value_col,
+    )
+
+    analysis.update(seasonality)
+
+    # ---------------------------------------------------------
+    # Signal Quality
+    # ---------------------------------------------------------
+
+    quality = analyze_signal_quality(
+        df,
+        date_col,
+        value_col,
+    )
+
+    analysis.update(quality)
+
+    # ---------------------------------------------------------
+    # AI Recommended Model
+    # ---------------------------------------------------------
+
+    trend_strength = analysis.get("trend_strength", "")
+    seasonality_strength = analysis.get("seasonality", "")
+    snr = analysis.get("signal_to_noise_ratio", 0)
+    frequency = detect_frequency(df, date_col)
+
+    recommended = "ARIMA"
+    reason = []
+
+    if (
+        seasonality_strength == "Strong"
+        and trend_strength in ["Strong", "Very Strong"]
+    ):
+        recommended = "SARIMA"
+        reason.append("Strong trend and strong seasonality detected.")
+
+    elif (
+        seasonality_strength == "Strong"
+        and trend_strength in ["Weak", "Very Weak"]
+    ):
+        recommended = "Exponential Smoothing"
+        reason.append("Seasonality dominates the series.")
+
+    elif (
+        trend_strength in ["Strong", "Very Strong"]
+        and seasonality_strength == "None"
+    ):
+        recommended = "ARIMA"
+        reason.append("Strong trend with little seasonality.")
+
+    elif frequency["name"] in [
+        "Hourly",
+        "Daily",
+        "Weekly",
+        "Monthly",
+    ]:
+        recommended = "Prophet"
+        reason.append("Regular calendar frequency detected.")
+
+    if snr < 1:
+        reason.append("High noise detected; forecast confidence may be lower.")
+
+    analysis["recommended_model"] = recommended
+    analysis["recommendation_reason"] = " ".join(reason)
+
+    # ---------------------------------------------------------
+    # Forecast Readiness Score
+    # ---------------------------------------------------------
+
+    score = 100
+
+    score -= analysis.get("missing_percent", 0) * 0.5
+    score -= analysis.get("outlier_percent", 0) * 0.7
+
+    if snr < 1:
+        score -= 25
+    elif snr < 2:
+        score -= 10
+
+    score = max(0, min(score, 100))
+
+    analysis["forecast_readiness"] = round(score, 1)
+
+    if score >= 90:
+        analysis["forecast_grade"] = "A+"
+
+    elif score >= 80:
+        analysis["forecast_grade"] = "A"
+
+    elif score >= 70:
+        analysis["forecast_grade"] = "B"
+
+    elif score >= 60:
+        analysis["forecast_grade"] = "C"
+
+    else:
+        analysis["forecast_grade"] = "Needs Improvement"
+
+    return analysis
 
 def optimize_dataframe(df: pd.DataFrame, date_parse_success_threshold: float = 0.9) -> pd.DataFrame:
     """Reduce memory footprint without changing the data's meaning.
@@ -335,76 +3245,82 @@ def time_series_analysis(df: pd.DataFrame, date_col: str, value_col: str) -> pd.
     """Full time series analysis: overview, decomposition, forecasting,
     anomaly detection, feature engineering."""
     try:
-        df = df.copy()
 
-        with st.spinner("Initializing time series data..."):
-            try:
-                df[date_col] = safe_to_datetime(df[date_col])
-                df = df.dropna(subset=[date_col])
-                df = df.sort_values(date_col)
-                df.set_index(date_col, inplace=True)
+        # ======================================================
+        # AI Cleaning Pipeline
+        # ======================================================
 
-                if value_col in df.columns:
-                    df = df[[value_col]]
-                else:
-                    st.error(f"Value column '{value_col}' not found in dataframe")
-                    return df
-            except Exception as e:
-                st.error(f"Initial preprocessing error: {e}")
-                return df
-
-            st.markdown("### 📊 Data Overview")
-
-            # Display all three metrics in columns with consistent sizing
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Data Points", len(df))
-            col2.metric("Missing Values", int(df.isnull().sum().sum()))
-
-            # Date range as a metric with consistent formatting
-            if len(df) > 0:
-                date_range_text = f"{df.index.min().date()} → {df.index.max().date()}"
-                col3.metric("Date Range", date_range_text)
-
-        with st.expander("📋 Data Preview", expanded=True):
-            st.dataframe(df.head(100), width="stretch")
-
-        df = preprocess_time_series(df, value_col)
-
-        if df.empty:
-            st.warning("No data remains after preprocessing. Adjust your options above.")
-            return df
-
-        st.markdown("### 📈 Time Series Analysis")
-        st.write(f"**Analyzing:** `{value_col}` over `{date_col}`")
-
-        # Display data points and date range on separate lines with consistent formatting
-        st.write(f"**Data Points:** {len(df):,}")
-        if len(df) > 0:
-            st.write(f"**Time Range:** {df.index.min().date()} to {df.index.max().date()}")
-
-        analysis_section = st.radio(
-            "Select Analysis Section:",
-            ["📊 Overview", "🔍 Decomposition", "📈 Forecasting", "⚠️ Anomaly Detection", "🛠 Feature Engineering"],
-            horizontal=True,
-            label_visibility="collapsed",
+        df, cleaning_report = clean_time_series(
+            df,
+            date_col,
+            value_col,
         )
 
-        if analysis_section == "📊 Overview":
-            _render_overview(df, date_col, value_col)
-        elif analysis_section == "🔍 Decomposition":
-            _render_decomposition(df, value_col)
-        elif analysis_section == "📈 Forecasting":
-            _render_forecasting(df, date_col, value_col)
-        elif analysis_section == "⚠️ Anomaly Detection":
-            _render_anomaly_detection(df, date_col, value_col)
-        elif analysis_section == "🛠 Feature Engineering":
-            df = _render_feature_engineering(df, value_col)
+        with st.expander("🧹 Data Cleaning Report", expanded=False):
+            st.json(cleaning_report)
 
-        return df
+        # ------------------------------------------------------
+
+        df.set_index(date_col, inplace=True)
+
+        if value_col in df.columns:
+            df = df[[value_col]]
+        else:
+            st.error(f"Value column '{value_col}' not found in dataframe")
+            return df
 
     except Exception as e:
-        st.error(f"Unexpected error in time series analysis: {e}")
+        st.error(f"Initial preprocessing error: {e}")
         return df
+
+    st.markdown("### 📊 Data Overview")
+
+    # Display all three metrics in columns with consistent sizing
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Data Points", len(df))
+    col2.metric("Missing Values", int(df.isnull().sum().sum()))
+
+    # Date range as a metric with consistent formatting
+    if len(df) > 0:
+        date_range_text = f"{df.index.min().date()} → {df.index.max().date()}"
+        col3.metric("Date Range", date_range_text)
+
+    with st.expander("📋 Data Preview", expanded=True):
+        st.dataframe(df.head(100), width="stretch")
+
+    df = preprocess_time_series(df, value_col)
+
+    if df.empty:
+        st.warning("No data remains after preprocessing. Adjust your options above.")
+        return df
+
+    st.markdown("### 📈 Time Series Analysis")
+    st.write(f"**Analyzing:** `{value_col}` over `{date_col}`")
+
+    # Display data points and date range on separate lines with consistent formatting
+    st.write(f"**Data Points:** {len(df):,}")
+    if len(df) > 0:
+        st.write(f"**Time Range:** {df.index.min().date()} to {df.index.max().date()}")
+
+    analysis_section = st.radio(
+        "Select Analysis Section:",
+        ["📊 Overview", "🔍 Decomposition", "📈 Forecasting", "⚠️ Anomaly Detection", "🛠 Feature Engineering"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if analysis_section == "📊 Overview":
+        _render_overview(df, date_col, value_col)
+    elif analysis_section == "🔍 Decomposition":
+        _render_decomposition(df, value_col)
+    elif analysis_section == "📈 Forecasting":
+        _render_forecasting(df, date_col, value_col)
+    elif analysis_section == "⚠️ Anomaly Detection":
+        _render_anomaly_detection(df, date_col, value_col)
+    elif analysis_section == "🛠 Feature Engineering":
+        df = _render_feature_engineering(df, value_col)
+
+    return df
 
 
 def _render_overview(df, date_col, value_col):
@@ -536,111 +3452,158 @@ def _render_decomposition(df, value_col):
 
 
 def _render_forecasting(df, date_col, value_col):
-    st.markdown("#### Time Series Forecasting")
-    forecast_df = df.copy()
 
-    forecast_method = st.selectbox(
-        "Select Forecasting Method",
-        ["Naive", "Moving Average", "Exponential Smoothing", "ARIMA", "SARIMA", "Prophet"],
-        index=0, key="forecast_method",
+    st.markdown("#### 🤖 AI Forecasting")
+
+    try:
+        # Show progress during forecast pipeline
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        status_text.info("🔄 Step 1/4: Preparing data...")
+        progress_bar.progress(10)
+
+        forecast_df = (
+            df.reset_index()
+            .copy()
+        )
+
+        status_text.info("🔄 Step 2/4: Training models...")
+        progress_bar.progress(40)
+
+        forecast_info = forecast_pipeline(
+            df.reset_index(),
+            date_col,
+            value_col,
+        )
+
+        status_text.info("🔄 Step 3/4: Evaluating performance...")
+        progress_bar.progress(70)
+
+        # Clear progress indicators
+        progress_bar.progress(100)
+        status_text.success("✅ Forecast complete!")
+
+    except Exception as e:
+
+        st.error(f"Forecast initialization failed: {e}")
+
+        return
+
+    analysis = forecast_info["metadata"]["analysis"]
+
+    st.markdown("## 🤖 AI Forecast Summary")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    frequency = analysis.get("frequency", {})
+
+    c1.metric(
+        "Dataset",
+        analysis.get("dataset_type", "Unknown")
     )
+
+    c2.metric(
+        "Frequency",
+        frequency.get("name", "Unknown")
+    )
+
+    c3.metric(
+        "Recommended",
+        forecast_info.get("best_model", analysis.get("recommended_model", "Unknown"))
+    )
+
+    c4.metric(
+        "Readiness",
+        f"{analysis.get('forecast_readiness', 0):.1f}%"
+    )
+
+    leaderboard = forecast_info["leaderboard"]
+
+    st.markdown("## 🏆 Model Leaderboard")
+
+    st.dataframe(
+        leaderboard,
+        width='stretch',
+        hide_index=False
+    )
+
+    train = forecast_info["train"]
+
+    test = forecast_info["test"]
+
+    best_model = forecast_info["best_model"]
+
+    models = [
+        "🤖 Auto (Recommended)",
+        "ARIMA",
+        "SARIMA",
+        "Holt-Winters",
+        "Moving Average",
+        "Naive",
+    ]
+
+    model_choice = st.selectbox(
+        "Forecast Model",
+        models,
+    )
+
     forecast_periods = st.slider("Forecast periods (future steps)", 1, 365, 30, key="forecast_periods")
-    test_size = st.slider("Test Size (%) for Evaluation", 10, 50, 20, key="test_size")
 
-    train_size = int(len(forecast_df) * (1 - test_size / 100))
-    train, test = forecast_df.iloc[:train_size], forecast_df.iloc[train_size:]
+    if model_choice == "🤖 Auto (Recommended)":
 
-    lower, upper = None, None  # real confidence interval, when available
-    model_name = "Forecast"
-    forecast = None
+        selected_model = best_model
 
-    with st.spinner(f"Training {forecast_method} model..."):
-        try:
-            if forecast_method == "Naive":
-                last_value = train[value_col].iloc[-1]
-                forecast = np.repeat(last_value, forecast_periods)
-                model_name = "Naive Forecast"
+    else:
 
-            elif forecast_method == "Moving Average":
-                window = st.slider("Moving Average Window", 1, 30, 3, key="ma_window")
-                last_ma = train[value_col].rolling(window=window).mean().iloc[-1]
-                # Project the last rolling value forward as a flat
-                # continuation -- this IS what a moving-average forecast
-                # is; it must not reuse historical rolling values as if
-                # they were future predictions.
-                forecast = np.repeat(last_ma, forecast_periods)
-                model_name = f"{window}-period Moving Average"
+        selected_model = model_choice
 
-            elif forecast_method == "Exponential Smoothing":
-                seasonal_periods = st.slider("Seasonal Periods", 2, 52, 12, key="es_seasonal_periods")
-                model = ExponentialSmoothing(
-                    train[value_col], trend="add", seasonal="add", seasonal_periods=seasonal_periods
-                ).fit()
-                forecast = np.asarray(model.forecast(forecast_periods))
-                model_name = "Holt-Winters Exponential Smoothing"
-                # Approximate prediction interval via simulation.
-                try:
-                    sims = model.simulate(forecast_periods, repetitions=200, random_state=RANDOM_STATE)
-                    lower = sims.quantile(0.05, axis=1).to_numpy()
-                    upper = sims.quantile(0.95, axis=1).to_numpy()
-                except Exception:
-                    lower, upper = None, None
+    selected_result = forecast_info["results"][selected_model]
 
-            elif forecast_method in ("ARIMA", "SARIMA"):
-                order_p = st.slider("AR Order (p)", 0, 5, 1, key="order_p")
-                order_d = st.slider("Difference Order (d)", 0, 2, 1, key="order_d")
-                order_q = st.slider("MA Order (q)", 0, 5, 1, key="order_q")
+    metrics = selected_result["metrics"]
 
-                if forecast_method == "ARIMA":
-                    fitted = ARIMA(train[value_col], order=(order_p, order_d, order_q)).fit()
-                    model_name = f"ARIMA({order_p},{order_d},{order_q})"
-                else:
-                    seasonal_p = st.slider("Seasonal AR Order (P)", 0, 2, 0, key="seasonal_p")
-                    seasonal_d = st.slider("Seasonal Difference (D)", 0, 1, 0, key="seasonal_d")
-                    seasonal_q = st.slider("Seasonal MA Order (Q)", 0, 2, 0, key="seasonal_q")
-                    seasonal_period = st.slider("Seasonal Period (s)", 4, 24, 12, key="seasonal_period_sarima")
-                    fitted = SARIMAX(
-                        train[value_col], order=(order_p, order_d, order_q),
-                        seasonal_order=(seasonal_p, seasonal_d, seasonal_q, seasonal_period),
-                    ).fit(disp=False)
-                    model_name = (
-                        f"SARIMA({order_p},{order_d},{order_q})"
-                        f"({seasonal_p},{seasonal_d},{seasonal_q})[{seasonal_period}]"
-                    )
+    model_name = selected_model
 
-                pred = fitted.get_forecast(steps=forecast_periods)
-                forecast = np.asarray(pred.predicted_mean)
-                ci = pred.conf_int(alpha=0.10)  # 90% interval
-                lower = ci.iloc[:, 0].to_numpy()
-                upper = ci.iloc[:, 1].to_numpy()
+    future_result = generate_future_forecast(
+        df.reset_index(),
+        date_col,
+        value_col,
+        selected_model,
+        forecast_periods,
+    )
 
-                converged = getattr(fitted, "mle_retvals", {}).get("converged", True)
-                if not converged:
-                    st.warning(
-                        "The optimizer did not fully converge -- treat this forecast "
-                        "with caution and consider different orders."
-                    )
+    forecast = future_result["forecast"]
 
-            elif forecast_method == "Prophet":
-                prophet_df = train[value_col].reset_index()
-                prophet_df.columns = ["ds", "y"]
-                model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
-                model.fit(prophet_df)
-                future = model.make_future_dataframe(periods=forecast_periods)
-                forecast_result = model.predict(future)
-                tail = forecast_result.iloc[-forecast_periods:]
-                forecast = tail["yhat"].to_numpy()
-                lower = tail["yhat_lower"].to_numpy()
-                upper = tail["yhat_upper"].to_numpy()
-                model_name = "Facebook Prophet"
+    future_dates = future_result["future_dates"]
 
-        except Exception as e:
-            st.error(f"Error fitting {forecast_method} model: {e}")
-            forecast = np.repeat(train[value_col].mean(), forecast_periods)
-            model_name = "Fallback Mean Forecast"
+    lower = future_result["lower"]
 
-    freq = pd.infer_freq(forecast_df.index)
-    future_dates = pd.date_range(forecast_df.index[-1], periods=forecast_periods + 1, freq=freq)[1:]
+    upper = future_result["upper"]
+
+    st.info(
+        f"""
+    ### 🤖 AI Recommendation
+
+    **Selected Model**
+
+    ✅ **{selected_model}**
+
+    Forecast Readiness:
+    **{analysis.get('forecast_readiness', 0):.1f}%**
+
+    Reason:
+
+    {analysis.get('recommendation_reason', 'No recommendation available.')}
+    """
+    )
+
+    if lower is not None:
+        lower = np.asarray(lower)[:len(forecast)]
+
+    if upper is not None:
+        upper = np.asarray(upper)[:len(forecast)]
+
+    future_dates = future_dates[:len(forecast)]
 
     with st.spinner("Generating forecast plot..."):
         fig_forecast = go.Figure()
@@ -691,18 +3654,29 @@ def _render_forecasting(df, date_col, value_col):
             except Exception as e:
                 st.error(f"Error generating plot image: {e}")
 
-    if len(test) > 0 and len(test) >= forecast_periods:
-        actual = test[value_col].iloc[:forecast_periods]
-        mae = mean_absolute_error(actual, forecast)
-        rmse = float(np.sqrt(mean_squared_error(actual, forecast)))
-        mape = safe_mape(actual, forecast)
+    st.markdown("### 📈 Forecast Performance")
 
-        st.markdown("#### Forecast Evaluation Metrics")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("MAE", f"{mae:.2f}")
-        col2.metric("RMSE", f"{rmse:.2f}")
-        col3.metric("MAPE", f"{mape:.2f}%" if not np.isnan(mape) else "N/A (zero actuals)")
+    m1, m2, m3, m4 = st.columns(4)
 
+    m1.metric(
+        "RMSE",
+        f"{metrics['RMSE']:.3f}"
+    )
+
+    m2.metric(
+        "MAE",
+        f"{metrics['MAE']:.3f}"
+    )
+
+    m3.metric(
+        "MAPE",
+        f"{metrics['MAPE']:.2f}%"
+    )
+
+    m4.metric(
+        "R²",
+        f"{metrics['R2']:.3f}"
+    )
 
 def _render_anomaly_detection(df, date_col, value_col):
     st.markdown("#### Anomaly Detection")
@@ -915,7 +3889,7 @@ def render_time_series_section():
     st.markdown("## ⏳ Time Series Analysis")
     st.markdown("Analyze, forecast, and visualize trends, patterns, seasonality, and anomalies in time-based data.")
 
-    with st.expander("ℹ️ Getting Started - Complete Guide to Time Series Analysis", expanded=True):
+    with st.expander("ℹ️ Getting Started - Complete Guide to Time Series Analysis", expanded=False):
         st.markdown("""
       # 📚 Complete Guide to Time Series Analysis
 
@@ -1446,18 +4420,34 @@ def render_time_series_section():
         st.info("Please upload and load a dataset first to use time series analysis features.")
         return
 
+    # ============================================================
+    # Automatic Datetime Detection
+    # ============================================================
+
     datetime_cols = list(df.select_dtypes(include=["datetime", "datetime64[ns]"]).columns)
 
     if not datetime_cols:
-        # Try to find a column that reliably parses as a date rather than
-        # blindly converting the first column that doesn't error out.
-        for col in df.columns:
-            parsed = safe_to_datetime(df[col])
-            if parsed.notna().mean() >= 0.9:
-                df[col] = parsed
-                datetime_cols = [col]
-                session_manager.set_data(section, "df", df)
-                break
+
+        detected_date = detect_datetime_column(df)
+
+        if detected_date is not None:
+            df[detected_date] = safe_to_datetime(df[detected_date])
+
+            # Remove invalid timestamps
+            df = df[df[detected_date].notna()].copy()
+
+            # Sort chronologically
+            df = df.sort_values(detected_date)
+
+            # Remove duplicate timestamps
+            df = df.drop_duplicates(subset=detected_date)
+
+            # Reset index
+            df = df.reset_index(drop=True)
+
+            datetime_cols = [detected_date]
+
+            session_manager.set_data(section, "df", df)
 
     numeric_cols = list(df.select_dtypes(include=["number"]).columns)
 
@@ -1465,9 +4455,84 @@ def render_time_series_section():
         with st.expander("📅 Time Series Setup", expanded=True):
             col1, col2 = st.columns(2)
             with col1:
-                date_col = st.selectbox("Select Date Column", datetime_cols, key="date_col")
+                default_date = detect_datetime_column(df)
+
+                if default_date in datetime_cols:
+                    default_idx = datetime_cols.index(default_date)
+                else:
+                    default_idx = 0
+
+                date_col = st.selectbox(
+                    "Select Date Column",
+                    datetime_cols,
+                    index=default_idx,
+                    key="date_col"
+                )
             with col2:
-                value_col = st.selectbox("Select Value Column", numeric_cols, key="value_col")
+
+                recommended_target, target_scores = detect_target_column(df)
+
+                if recommended_target is not None:
+
+                    st.info(
+                        f"""
+            ### 🤖 AI Recommendation
+
+            **Recommended Target Column**
+
+            ✅ **{recommended_target}**
+            """
+                    )
+
+                    with st.expander("🤖 AI Target Analysis"):
+
+                        ranking = (
+                            pd.DataFrame(
+                                {
+                                    "Column": list(target_scores.keys()),
+                                    "Score": list(target_scores.values())
+                                }
+                            )
+                            .sort_values("Score", ascending=False)
+                            .reset_index(drop=True)
+                        )
+
+                        ranking.index += 1
+
+                        st.dataframe(
+                            ranking,
+                            width='stretch',
+                            hide_index=False
+                        )
+
+                        st.caption(
+                            """
+            Recommendation is based on
+
+            • Missing Values
+
+            • Variance
+
+            • Number of Unique Values
+
+            • Continuous Data
+
+            • Column Name Intelligence
+            """
+                        )
+
+                    default_index = numeric_cols.index(recommended_target)
+
+                else:
+
+                    default_index = 0
+
+                value_col = st.selectbox(
+                    "🎯 Select Target Column",
+                    numeric_cols,
+                    index=default_index,
+                    key="value_col"
+                )
 
         if len(df) > 10_000 or len(df.columns) > 50:
             st.warning(
